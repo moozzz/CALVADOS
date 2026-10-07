@@ -34,6 +34,7 @@ TopolType: TypeAlias = Literal[
     "center",
     "shift_ref_bead",
     "random",
+    "pdb",
 ]
 
 class ComponentInput(BaseModel):
@@ -323,5 +324,21 @@ def validate_inputs(
         raise ValueError(
             "slab_outer must be provided for slab systems containing crowders"
         )
+
+    if config_model.topol == "pdb":
+        # Each molecule is placed at the absolute coordinates of its input structure.
+        for component in component_models.values():
+            if component.nmol == 0 or component.molecule_type in ["lipid", "cooke_lipid"]:
+                continue
+            if component.nmol > 1:
+                raise ValueError(
+                    f"Topol 'pdb' requires nmol = 1 (component {component.name!r} "
+                    f"has nmol = {component.nmol})"
+                )
+            if not component.restraint:
+                raise ValueError(
+                    "Topol 'pdb' requires coordinates from a PDB/CIF file, i.e. "
+                    f"restraint = True (component {component.name!r})"
+                )
 
     return config_model, component_models

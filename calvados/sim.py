@@ -89,6 +89,8 @@ class Sim:
         for name, comp_params in self.comp_dict.items():
             component_class = COMPONENT_REGISTRY[comp_params.molecule_type]
             comp = component_class(name, comp_params)
+            # topol 'pdb': keep the absolute input coordinates (read in calc_properties)
+            comp.pdb_keep_origin = self.config.topol == 'pdb'
 
             comp.calc_properties(
                 pH=self.config.pH,
@@ -415,6 +417,12 @@ class Sim:
             x0 = self.box * 0.5 # place in center of box
             xs = x0 + comp.xinit
             xs -= comp.xinit[self.config.ref_bead]
+        elif self.config.topol == 'pdb':
+            # absolute coordinates from the input structure, no shift
+            xs = np.array(comp.xinit, dtype=np.float64)
+            if build.check_walls(xs, self.box):
+                print(f'Note: beads of {comp.name} lie outside the box [0, L]; '
+                      'they are treated with periodic boundary conditions.')
         else:
             xs_others = np.array(self.pos, dtype=float)
             xs = build.random_placement(self.box, xs_others, comp.xinit, ntries=ntries)

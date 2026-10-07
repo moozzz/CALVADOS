@@ -205,6 +205,8 @@ class Protein(Component):
         self.xinit, self.dimensions = build.geometry_from_pdb(
             structure_file,
             use_com=self.params.use_com,
+            # pdb_keep_origin is set by Sim.make_components (topol == 'pdb')
+            center_to_com=not getattr(self, "pdb_keep_origin", False),
         )  # read from pdb
 
     def calc_ssdomains(self) -> None:
@@ -436,7 +438,9 @@ class RNA(Component):
                 "Cannot find input PDB/CIF file for RNA"
             )
         self.xinit, self.dimensions = build.geometry_from_pdb_rna(
-            struct_file, use_com=self.params.use_com
+            struct_file,
+            use_com=self.params.use_com,
+            center_to_com=not getattr(self, "pdb_keep_origin", False),
         )
 
     def calc_ssdomains(self) -> None:

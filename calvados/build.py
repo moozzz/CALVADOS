@@ -308,7 +308,7 @@ def build_xyzgrid(N: float, box: NDArray[np.float64]) -> NDArray[np.float64]:
 
 # FOLDED
 def geometry_from_pdb(
-    pdb: InputPath, use_com: bool = False
+    pdb: InputPath, use_com: bool = False, center_to_com: bool = True
 ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
     """Return protein coordinates and box lengths converted from Å to nm."""
     pdb = str(pdb)
@@ -320,7 +320,8 @@ def geometry_from_pdb(
         else:
             u = Universe(pdb)
     ag = u.atoms
-    ag.translate(-ag.center_of_mass())
+    if center_to_com:
+        ag.translate(-ag.center_of_mass())
     if use_com:
         coms = [res.atoms.center_of_mass() for res in u.residues]
         pos = np.array(coms) / 10.0
@@ -335,7 +336,7 @@ def geometry_from_pdb(
 
 
 def geometry_from_pdb_rna(
-    pdb: InputPath, use_com: bool = False
+    pdb: InputPath, use_com: bool = False, center_to_com: bool = True
 ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
     """Return RNA coordinates and box lengths converted from Å to nm."""
     backbone_atoms_name = [
@@ -364,7 +365,8 @@ def geometry_from_pdb_rna(
         simplefilter("ignore")
         u = Universe(str(pdb))
     ag = u.atoms
-    ag.translate(-ag.center_of_mass())
+    if center_to_com:
+        ag.translate(-ag.center_of_mass())
     positions = []
     if use_com:
         for res in u.residues:
