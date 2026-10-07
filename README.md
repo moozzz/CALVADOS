@@ -72,3 +72,11 @@ The test `test_potentials` simulates two free amino acids, calculates the potent
 
 [Maxim Igaev (@moozzz)](https://github.com/moozzz)
 
+1. `topol = 'pdb'` to keep absolute input coordinates from PDB
+
+2. Fast and memory-optimized system building
+
+3. COM position restraints and constant-force pulling
+
+4. `platform = 'OpenCL'` accepted along with `CPU` and `CUDA`
+

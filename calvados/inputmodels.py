@@ -146,7 +146,7 @@ class SimulationInput(BaseModel):
 
     steps: PositiveInt | None = None
     wfreq: PositiveInt = 100000
-    platform: Literal["CPU","CUDA"] = "CPU"
+    platform: Literal["CPU","CUDA","OpenCL"] = "CPU"
     threads: PositiveInt = 1
     runtime: PositiveFloat | None = None
     restart: Literal["checkpoint","pdb","cif"] | None = "checkpoint"
