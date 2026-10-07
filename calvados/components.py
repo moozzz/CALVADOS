@@ -2,6 +2,7 @@ import os
 from typing import Any
 
 import numpy as np
+from MDAnalysis.lib import distances
 from numpy.typing import NDArray
 from openmm.openmm import Force
 from openmm.unit import (
@@ -11,6 +12,7 @@ from openmm.unit import (
     radian,
 )
 from pandas import read_csv
+from scipy.spatial import cKDTree
 from scipy.special import expit
 
 from . import build, interactions
@@ -23,6 +25,35 @@ from .sequence import (
     read_fasta,
     seq_from_pdb,
 )
+
+
+class PairDistances:
+    """Distances between beads, computed on demand instead of an N x N matrix.
+
+    Uses MDAnalysis calc_bonds, the routine behind analysis.self_distances, so the
+    values are identical to those of the full distance matrix.
+    """
+
+    def __init__(self, xyz: NDArray[np.float64], box: NDArray[np.float64] | None = None):
+        self.xyz = np.asarray(xyz, dtype=np.float64)
+        self.box = box  # [Lx, Ly, Lz, alpha, beta, gamma] (nm, degrees) or None
+
+    def __getitem__(self, ij: tuple[int, int]) -> np.float64:
+        i, j = ij
+        return distances.calc_bonds(self.xyz[i][None], self.xyz[j][None], box=self.box)[0]
+
+    def pairs(self, i: NDArray[np.int64], j: NDArray[np.int64]) -> NDArray[np.float64]:
+        """Distances of the pairs (i[k], j[k])."""
+        return distances.calc_bonds(self.xyz[i], self.xyz[j], box=self.box)
+
+    def neighbour_pairs(self, r: float) -> NDArray[np.int64]:
+        """All pairs i < j closer than r (minimum image in a rectangular box)."""
+        if self.box is None:
+            return cKDTree(self.xyz).query_pairs(r, output_type="ndarray")
+        size = np.asarray(self.box[:3], dtype=np.float64)
+        wrapped = np.mod(self.xyz, size)
+        wrapped[wrapped >= size] = 0.0
+        return cKDTree(wrapped, boxsize=size).query_pairs(r, output_type="ndarray")
 
 
 class Component:
@@ -146,23 +177,35 @@ class Component:
         self.bond_pairlist: list[Any] = []
         self.hb = interactions.init_bonded_interactions()
 
+    def bonded_pairs(self) -> list[tuple[int, int]]:
+        """Return the bonded bead pairs (i < j), ordered by i and then j."""
+        if type(self).bond_check is Protein.bond_check:
+            # linear chains: consecutive beads, except across chain breaks
+            c_termini, n_termini = set(self.c_termini), set(self.n_termini)
+            return [
+                (i, i + 1) for i in range(self.nbeads - 1)
+                if i not in c_termini and i + 1 not in n_termini
+            ]
+        return [
+            (i, j) for i in range(self.nbeads - 1) for j in range(i + 1, self.nbeads)
+            if self.bond_check(i, j)
+        ]
+
     def add_bonds(self, offset: int) -> list[list[int]]:
         """Add component bonds and return their nonbonded exclusions."""
         exclusion_map = []  # for ah, yu etc.
-        for i in range(self.nbeads - 1):
-            for j in range(i, self.nbeads):
-                if self.bond_check(i, j):
-                    d = self.calc_bondlength(i, j)
-                    bidx = self.hb.addBond(
-                        i + offset,
-                        j + offset,
-                        d * nanometer,
-                        self.params.kb * kilojoules_per_mole / (nanometer**2),
-                    )
-                    self.bond_pairlist.append(
-                        [i + offset + 1, j + offset + 1, bidx, d, self.params.kb]
-                    )  # 1-based
-                    exclusion_map.append([i + offset, j + offset])
+        for i, j in self.bonded_pairs():
+            d = self.calc_bondlength(i, j)
+            bidx = self.hb.addBond(
+                i + offset,
+                j + offset,
+                d * nanometer,
+                self.params.kb * kilojoules_per_mole / (nanometer**2),
+            )
+            self.bond_pairlist.append(
+                [i + offset + 1, j + offset + 1, bidx, d, self.params.kb]
+            )  # 1-based
+            exclusion_map.append([i + offset, j + offset])
         return exclusion_map
 
     def get_forces(self) -> None:
@@ -209,11 +252,26 @@ class Protein(Component):
             center_to_com=not getattr(self, "pdb_keep_origin", False),
         )  # read from pdb
 
+    def calc_dmap(self) -> None:
+        """Calculate the intracomponent distances: on demand for harmonic restraints
+        without a box or in a rectangular periodic box, else the full matrix."""
+        if self.params.restraint_type == "harmonic" and (
+            not self.params.periodic
+            or (self.dimensions is not None and np.allclose(self.dimensions[3:], 90.0))
+        ):
+            box = self.dimensions if self.params.periodic else None
+            self.dmap = PairDistances(self.xinit, box)  # type: ignore[assignment]
+        else:
+            super().calc_dmap()
+
     def calc_ssdomains(self) -> None:
         """Load the structured domains used for harmonic restraints."""
 
         assert self.params.fdomains is not None
-        self.ssdomains = build.get_ssdomains(self.name, self.params.fdomains)
+        # sets: constant-time membership tests in build.check_ssdomain
+        self.ssdomains = [  # type: ignore[assignment]
+            set(domain) for domain in build.get_ssdomains(self.name, self.params.fdomains)
+        ]
 
     def calc_go_scale(
         self, bscale_shift: float = 0.1, bscale_width: float = 80
@@ -335,6 +393,26 @@ class Protein(Component):
     ) -> list[list[int]]:
         """Add protein restraints and return their nonbonded exclusions."""
         exclusion_map = []  # for ah, yu etc.
+
+        if isinstance(self.dmap, PairDistances):
+            # harmonic: the same pairs and order as the loop below, but only the
+            # candidates from a neighbour search are tested
+            cutoff = self.params.cutoff_restr
+            pairs = self.dmap.neighbour_pairs(cutoff + 1e-3)
+            pairs = pairs[pairs[:, 1] >= pairs[:, 0] + 2]
+            dists = self.dmap.pairs(pairs[:, 0], pairs[:, 1])
+            keep = ~(dists > cutoff)
+            pairs, dists = pairs[keep], dists[keep]
+            order = np.lexsort((pairs[:, 1], pairs[:, 0]))
+            for (i, j), dij in zip(pairs[order].tolist(), dists[order]):
+                if not build.check_ssdomain(self.ssdomains, i, j, req_both=True):
+                    continue
+                self.cs, restr_pair = interactions.add_single_restraint(
+                    self.cs, "harmonic", dij, self.params.k_harmonic, i + offset, j + offset
+                )
+                self.restr_pairlist.append(restr_pair)
+                exclusion_map.append([i + offset, j + offset])
+            return exclusion_map
 
         for i in range(self.nbeads - 2):
             for j in range(i + 2, self.nbeads):

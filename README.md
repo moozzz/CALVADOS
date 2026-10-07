@@ -68,3 +68,7 @@ The test `test_potentials` simulates two free amino acids, calculates the potent
 
 [Kresten Lindorff-Larsen (@lindorff-larsen)](https://github.com/lindorff-larsen)
 
+## Experimental features
+
+[Maxim Igaev (@moozzz)](https://github.com/moozzz)
+

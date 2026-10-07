@@ -582,10 +582,9 @@ class Sim:
                     resname = str(comp.residues.loc[resname,'three'])
                 res = self.top.add_residue(resname, chain, resSeq=idx+1)
                 self.top.add_atom('CA', element=md.element.carbon, residue=res)
-            for i in range(chain.n_atoms-1):
-                for j in range(i+1, chain.n_atoms):
-                    if comp.bond_check(i,j):
-                        self.top.add_bond(chain.atom(i), chain.atom(j))
+            atoms = list(chain.atoms)
+            for i, j in comp.bonded_pairs():
+                self.top.add_bond(atoms[i], atoms[j])
 
     def add_particles_system(self, mws: FloatArray) -> None:
         """ Add particles of one molecule to openMM system. """
