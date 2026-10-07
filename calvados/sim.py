@@ -12,7 +12,7 @@ from openmm import app, unit
 from tqdm import tqdm
 from yaml import safe_load
 
-from . import build, interactions
+from . import build, interactions, posres
 from .components import (
     COMPONENT_REGISTRY,
     Component,
@@ -293,6 +293,10 @@ class Sim:
             self.map_custom_restraints()
             self.add_custom_restraints()
 
+        if self.config.position_restraints:
+            # COM position restraints and pulling, targets from the start structure
+            self.posres = posres.build(self)
+
         trajectory = md.Trajectory(self.pos, self.top, 0, self.box, [90,90,90])
 
         self.pdb_cg = f'{self.path}/top.pdb'
@@ -335,6 +339,12 @@ class Sim:
         if self.config.custom_restraints:
             self.system.addForce(self.cres)
             print(f'Number of custom restraints: {self.cres.getNumBonds()}')
+
+        # Position restraints and pulling (created in build_system)
+        if getattr(self, 'posres', None):
+            for force in self.posres:
+                self.system.addForce(force)
+            print(posres.summary(self.posres))
 
         # barostat force, for equilibration and/or production
         if self.box_eq or (self.config.box_eq and self.config.pressure_coupling):

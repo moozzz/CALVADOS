@@ -30,13 +30,13 @@ The examples described in the paper can be found in the `examples` folder.
 conda create -n calvados python=3.13
 conda activate calvados
 ```
-2. Install openmm via conda-force with cudatoolkit, if you are planning to run on GPUs with CUDA
+2. Install openmm via conda-forge with cuda-version (at most the "CUDA Version" shown by nvidia-smi), if you are planning to run on GPUs with CUDA
 ```
-conda install -c conda-forge openmm=8.2.0 cudatoolkit=11.8 mdanalysis=2.9 mdtraj=1.11
+conda install -c conda-forge openmm=8.4 cuda-version=12.8 mdanalysis=2.9 mdtraj=1.11
 ```
-or without cudatoolkit if you are running on CPU or OpenCL
+or without cuda-version if you are running on CPU or OpenCL
 ```
-conda install -c conda-forge openmm=8.2.0 mdanalysis=2.9 mdtraj=1.11
+conda install -c conda-forge openmm=8.4 mdanalysis=2.9 mdtraj=1.11
 ```
 3. Clone package and install CALVADOS and its dependencies using pip
 ``` 

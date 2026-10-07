@@ -177,6 +177,10 @@ class SimulationInput(BaseModel):
     custom_restraint_type: RestraintChoices = "harmonic"
     fcustom_restraints: InputPath = "custom_restraints.txt"
 
+    # COM position restraints and pulling of selected beads (calvados/posres.py)
+    position_restraints: bool = False
+    fposition_restraints: InputPath = "position_restraints.yaml"
+
     ref_bead: NonNegativeInt = 0
 
     @model_validator(mode="after")
