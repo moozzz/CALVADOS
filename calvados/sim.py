@@ -857,6 +857,10 @@ class Sim:
             )
         )
 
+        if getattr(self, 'posres', None) and hasattr(posres, 'add_reporter'):
+            # pulled groups: moving targets (constant velocity), pull_<sysname>.txt
+            posres.add_reporter(self, simulation, append)
+
         print("STARTING SIMULATION", flush=True)
         if self.config.runtime is not None: # in unit.hours
             simulation.runForClockTime(

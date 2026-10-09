@@ -1,8 +1,10 @@
-"""Position restraints and constant-force pulling on the centres of mass of selected beads.
+"""Position restraints, constant-force and constant-velocity pulling on the centres of mass
+of selected beads.
 
-Added by patch_calvados_position_restraints.py. Enabled in config.yaml with
+Added by patch_calvados_position_restraints_fpull_vpull.py. Enabled in config.yaml with
 position_restraints = True; fposition_restraints is a YAML file with a list of entries,
-each a position restraint (k) or a constant pulling force (force and direction):
+each a position restraint (k), a constant pulling force (force and direction) or
+constant-velocity pulling (velocity, k and direction):
 
 - selection: (chain Y and resid 682 to 691) or (chain Z and resid 442 to 451)
   k: 100.0         # restraint: force constant (kJ/mol/nm^2)
@@ -17,6 +19,14 @@ each a position restraint (k) or a constant pulling force (force and direction):
   force: 20.0          # pulling: constant force (kJ/mol/nm; 1 kJ/mol/nm = 1.66 pN)
   direction: [0, 0, -1]  # pulling: direction of the force (normalised)
   anchor: chain I J K L M N O P Q R   # optional: the anchor feels the opposite force
+
+- selection: (chain Y and resid 682 to 691) or (chain Z and resid 442 to 451)
+  per: unit YZ
+  velocity: 10.0       # constant velocity: speed of the spring's target (nm/ns)
+  k: 100.0             # constant velocity: spring constant along the direction (kJ/mol/nm^2)
+  direction: [0, 0, -1]
+  update_steps: 100    # optional: steps between moves of the target (default 100)
+  anchor: chain I J K L M N O P Q R   # optional: target moves relative to the anchor COM
 
 selection, anchor: VMD-style (chain, resid, resname, name, index, residue, ranges
   "a to b", and/or/not, parentheses) or MDAnalysis syntax, evaluated on the input
@@ -39,13 +49,22 @@ Pulling: E = -force n.d with the unit vector n of direction, i.e. a constant for
 force*n on the COM (distributed over its beads in proportion to their masses) and -force*n
 on the anchor COM. d is not minimum-imaged, so the force is exact for any pulled distance;
 the pulling energy jumps by force*n.L if OpenMM moves the pulled molecule by a box vector
-L (GPU platforms; forces and dynamics are not affected). COMs are weighted by the bead
-masses. Targets come from the start structure built from the input (top.pdb), also when
-the run continues from a checkpoint.
+L (GPU platforms; forces and dynamics are not affected).
+Constant-velocity pulling: E = 0.5 k (n.dt)^2 with dt the minimum-image displacement of
+the COM from its moving target, start + velocity*t*n (relative to the anchor COM), so only
+the component along n is restrained (the reaction acts on the anchor COM). dt is the lag
+behind the target and stays small, so any pulled distance is fine. PullReporter moves the
+targets every update_steps steps (the smallest value of all entries) to the middle of the
+next interval, adds up the work done by moving them (the jumps of the spring energy, exact
+for this stepwise protocol) and writes pull_<sysname>.txt every logfreq steps. t is the
+simulation time: it continues after a checkpoint, but restarts at 0 for restart =
+'pdb'/'cif'. COMs are weighted by the bead masses. Targets come from the start structure
+built from the input (top.pdb), also when the run continues from a checkpoint.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from typing import TYPE_CHECKING, Any, Self
@@ -61,6 +80,7 @@ from pydantic import (
     ConfigDict,
     NonNegativeFloat,
     PositiveFloat,
+    PositiveInt,
     field_validator,
     model_validator,
 )
@@ -73,16 +93,28 @@ RESTRAINT = (
     "d = pointdistance(x1, y1, z1, select(mx, {X}, x1), select(my, {Y}, y1), select(mz, {Z}, z1))"
 )
 PULL = "-f*(nx*(x1 - ({X})) + ny*(y1 - ({Y})) + nz*(z1 - ({Z})))"
+# spring along n to the moving target t = X + v*pull_time*n; n.(COM - t) from the minimum
+# images of COM - t -/+ n: |a + n|^2 - |a - n|^2 = 4 n.a
+VELOCITY = (
+    "0.5*k*p^2;"
+    "p = (pointdistance(x1, y1, z1, tx - nx, ty - ny, tz - nz)^2"
+    " - pointdistance(x1, y1, z1, tx + nx, ty + ny, tz + nz)^2)/4;"
+    "tx = {X} + nx*v*pull_time; ty = {Y} + ny*v*pull_time; tz = {Z} + nz*v*pull_time"
+)
 PARAMETERS = {
     "restraint": ["k", "r0", "x0", "y0", "z0", "mx", "my", "mz"],
     "pull": ["f", "x0", "y0", "z0", "nx", "ny", "nz"],
+    "velocity": ["k", "v", "x0", "y0", "z0", "nx", "ny", "nz"],
 }
+PULL_UPDATE_STEPS = 100  # default steps between moves of the constant-velocity targets
+PULL_FORCE_GROUP = 30    # force group of the constant-velocity springs (work bookkeeping)
 KJ_PER_NM_IN_PN = 1.66054  # 1 kJ/mol/nm in pN
 VMD_KEYWORDS = {"chain": "chainID", "residue": "resindex", "segname": "segid"}
 
 
 class PositionRestraintInput(BaseModel):
-    """One entry of the position-restraint file: a restraint (k) or a pulling force."""
+    """One entry of the position-restraint file: a restraint (k), a constant pulling force
+    (force) or constant-velocity pulling (velocity)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -92,7 +124,9 @@ class PositionRestraintInput(BaseModel):
     r0: NonNegativeFloat = 0.0
     dims: str = "xyz"
     force: float | None = None
+    velocity: float | None = None
     direction: tuple[float, float, float] | None = None
+    update_steps: PositiveInt | None = None
     anchor: str | None = None
     component: str | None = None
 
@@ -113,21 +147,31 @@ class PositionRestraintInput(BaseModel):
             raise ValueError("dims must be a combination of x, y and z, e.g. xyz or xy")
         return dims
 
+    @property
+    def kind(self) -> str:
+        return "pull" if self.force is not None else "velocity" if self.velocity is not None else "restraint"
+
     @model_validator(mode="after")
     def check_kind(self) -> Self:
-        if self.force is None:
+        if self.force is not None and self.velocity is not None:
+            raise ValueError("give force (constant force) or velocity (constant velocity), not both")
+        if self.update_steps is not None and self.kind != "velocity":
+            raise ValueError("update_steps: only for constant-velocity pulling")
+        if self.kind == "restraint":
             if self.k is None:
-                raise ValueError("a restraint needs k (or give force and direction for pulling)")
+                raise ValueError("a restraint needs k (or give force or velocity and direction for pulling)")
             if self.direction is not None:
-                raise ValueError("direction needs force (pulling)")
-        else:
-            if self.force == 0:
-                raise ValueError("force must not be zero")
-            if self.direction is None or not np.linalg.norm(self.direction) > 0:
-                raise ValueError("pulling needs a non-zero direction, e.g. [0, 0, 1]")
-            given = {"k", "r0", "dims"} & self.model_fields_set
-            if given:
-                raise ValueError(f"{', '.join(sorted(given))}: only for restraints, not for pulling")
+                raise ValueError("direction needs force or velocity (pulling)")
+            return self
+        if (self.force if self.kind == "pull" else self.velocity) == 0:
+            raise ValueError(f"{'force' if self.kind == 'pull' else 'velocity'} must not be zero")
+        if self.direction is None or not np.linalg.norm(self.direction) > 0:
+            raise ValueError("pulling needs a non-zero direction, e.g. [0, 0, 1]")
+        if self.kind == "velocity" and self.k is None:
+            raise ValueError("constant-velocity pulling needs the spring constant k")
+        given = ({"k", "r0", "dims"} if self.kind == "pull" else {"r0", "dims"}) & self.model_fields_set
+        if given:
+            raise ValueError(f"{', '.join(sorted(given))}: not for this kind of pulling")
         return self
 
 
@@ -217,13 +261,17 @@ def ranges(beads: np.ndarray) -> str:
 def make_force(kind: str, anchored: bool) -> openmm.CustomCentroidBondForce:
     """CustomCentroidBondForce for restraints or pulling; group 2 is the anchor."""
     target = ("x2 + x0", "y2 + y0", "z2 + z0") if anchored else ("x0", "y0", "z0")
-    expression = (RESTRAINT if kind == "restraint" else PULL).format(X=target[0], Y=target[1], Z=target[2])
+    template = {"restraint": RESTRAINT, "pull": PULL, "velocity": VELOCITY}[kind]
+    expression = template.format(X=target[0], Y=target[1], Z=target[2])
     force = openmm.CustomCentroidBondForce(2 if anchored else 1, expression)
     for p in PARAMETERS[kind]:
         force.addPerBondParameter(p)
-    # restraints: minimum-image distances; pulling: plain coordinate differences
-    force.setUsesPeriodicBoundaryConditions(kind == "restraint")
-    force.setName(("PositionRestraints" if kind == "restraint" else "Pulling")
+    if kind == "velocity":
+        force.addGlobalParameter("pull_time", 0.0)  # ps, set by PullReporter
+        force.setForceGroup(PULL_FORCE_GROUP)
+    # restraints and constant velocity: minimum image; constant force: plain coordinates
+    force.setUsesPeriodicBoundaryConditions(kind != "pull")
+    force.setName({"restraint": "PositionRestraints", "pull": "Pulling", "velocity": "PullingVelocity"}[kind]
                   + ("Anchored" if anchored else ""))
     return force
 
@@ -252,6 +300,10 @@ def build(sim: Sim) -> list[openmm.Force]:
 
     forces: dict[tuple[str, bool], openmm.CustomCentroidBondForce] = {}
     records = []
+    sim.posres_pulls = []  # pulled groups, for PullReporter
+    sim.posres_mass = mass
+    sim.posres_update_steps = min((e.update_steps or PULL_UPDATE_STEPS for e in entries
+                                   if e.kind == "velocity"), default=PULL_UPDATE_STEPS)
     for n, entry in enumerate(entries, 1):
         if entry.component is None:
             if len(with_structure) != 1:
@@ -271,16 +323,22 @@ def build(sim: Sim) -> list[openmm.Force]:
         groups = struct.groups(struct.beads(entry.selection), entry.per)
         anchor = None if entry.anchor is None else struct.beads(entry.anchor)
 
-        kind = "restraint" if entry.force is None else "pull"
+        kind = entry.kind
         if kind == "restraint":
             params = [entry.k, entry.r0]
             flags = [float(d in entry.dims) for d in "xyz"]
-            columns = f"restraint {entry.k:g} {entry.r0:g} {entry.dims} - - - -"
+            columns = f"restraint {entry.k:g} {entry.r0:g} {entry.dims} - - - - -"
         else:
             direction = np.asarray(entry.direction, dtype=float)
             direction /= np.linalg.norm(direction)
-            params, flags = [entry.force], direction.tolist()
-            columns = f"pull - - - {entry.force:g} " + " ".join(f"{x:.6f}" for x in direction)
+            flags = direction.tolist()
+            if kind == "pull":
+                params = [entry.force]
+                columns = f"pull - - - {entry.force:g} - "
+            else:
+                params = [entry.k, entry.velocity / 1000.0]  # nm/ns -> nm/ps
+                columns = f"velocity {entry.k:g} - - - {entry.velocity:g} "
+            columns += " ".join(f"{x:.6f}" for x in direction)
         key = (kind, anchor is not None)
         if key not in forces:
             forces[key] = make_force(*key)
@@ -299,6 +357,11 @@ def build(sim: Sim) -> list[openmm.Force]:
                 group = force.addGroup(b.tolist(), mass[b].tolist())
                 bond = [group] if anchor is None else [group, anchor_group]
                 force.addBond(bond, [*params, *target, *flags])
+                if kind != "restraint":
+                    sim.posres_pulls.append(dict(
+                        kind=kind, label=struct.describe(g), beads=b, target=target, n=direction,
+                        anchor=None if anchor is None else anchor + offset,
+                        k=entry.k, f=entry.force, v=None if entry.velocity is None else entry.velocity / 1000.0))
                 records.append(
                     f"{len(records) + 1} {n} {comp.name} {copy + 1} {struct.describe(g)} {columns} "
                     f"{target[0]:.4f} {target[1]:.4f} {target[2]:.4f} {len(b)} {ranges(b)} "
@@ -313,6 +376,13 @@ def build(sim: Sim) -> list[openmm.Force]:
                   f"{what} ({nbeads} beads), k = {entry.k:g} kJ/mol/nm^2, r0 = {entry.r0:g} nm, "
                   f"dims {entry.dims}"
                   + ("" if anchor is None else f", relative to the COM of {len(anchor)} anchor beads"))
+        elif kind == "velocity":
+            print(f"Pulling {n}: constant velocity {entry.velocity:g} nm/ns with a spring of "
+                  f"k = {entry.k:g} kJ/mol/nm^2 along ({', '.join(f'{x:.3g}' for x in direction)}) "
+                  f"on the COM of {what} ({len(groups) * comp.params.nmol} group(s) of {nbeads} beads), "
+                  f"target moved every {sim.posres_update_steps} steps"
+                  + ("" if anchor is None else
+                     f", target relative to the COM of {len(anchor)} anchor beads"))
         else:
             print(f"Pulling {n}: constant force {entry.force:g} kJ/mol/nm "
                   f"({entry.force * KJ_PER_NM_IN_PN:.3g} pN) along "
@@ -326,8 +396,88 @@ def build(sim: Sim) -> list[openmm.Force]:
                 "COM(beads) from its target in the restrained dims\n"
                 "# pull: constant force f along n on COM(beads) [and -f n on COM(anchor)], "
                 "E = -f n.d, d = displacement of COM(beads) from its target\n"
+                "# velocity: spring k along n to the target moving at v, E = 0.5 k (n.(COM(beads) - "
+                "target - v time n))^2 (minimum image)\n"
                 "# target t: start COM, or start COM - COM(anchor) with an anchor; beads 1-based\n"
                 "# id entry component copy chains type k[kJ/mol/nm^2] r0[nm] dims f[kJ/mol/nm] "
-                "nx ny nz tx[nm] ty[nm] tz[nm] nbeads beads anchor\n")
+                "v[nm/ns] nx ny nz tx[nm] ty[nm] tz[nm] nbeads beads anchor\n")
         f.writelines(records)
     return list(forces.values())
+
+
+class PullReporter:
+    """OpenMM reporter for the pulled groups (attached by Sim.simulate).
+
+    Constant velocity: every update_steps steps the targets move to the middle of the next
+    interval (pull_time = t + update_steps*dt/2), and the work done by moving them, the
+    change of the spring energy at fixed positions, is added up (exact for the stepwise
+    protocol). Every logfreq steps, pull_<sysname>.txt gets the time, the target
+    time, the total work and, for every pulled group, the displacement of its COM along n
+    since the start (relative to the anchor COM) and the force on it along n.
+    """
+
+    def __init__(self, sim: Sim, simulation: app.Simulation, append: bool):
+        self.pulls = sim.posres_pulls
+        self.mass = sim.posres_mass
+        self.velocity = any(p["kind"] == "velocity" for p in self.pulls)
+        self.nupdate = sim.posres_update_steps
+        self.nlog = sim.config.logfreq
+        self.dt = simulation.integrator.getStepSize().value_in_unit(unit.picosecond)
+        fname = f"{sim.path}/pull_{sim.config.sysname}.txt"
+        self.work = 0.0
+        if append:  # continue the work from the existing log
+            lines = [line for line in open(fname) if line.strip() and not line.startswith("#")] \
+                if os.path.isfile(fname) else []
+            self.work = float(lines[-1].split()[2]) if lines else 0.0
+        self.file = open(fname, "a" if append else "w")
+        if not append:
+            self.file.write("# pulled groups (see posres_*.txt): id type chains k[kJ/mol/nm^2] "
+                            "v[nm/ns] f[kJ/mol/nm] nx ny nz\n")
+            for i, p in enumerate(self.pulls, 1):
+                k = "-" if p["kind"] == "pull" else f"{p['k']:g}"
+                v = "-" if p["kind"] == "pull" else f"{1000 * p['v']:g}"
+                f = f"{p['f']:g}" if p["kind"] == "pull" else "-"
+                self.file.write(f"#   {i} {p['kind']} {p['label']} {k} {v} {f} "
+                                + " ".join(f"{x:.4f}" for x in p["n"]) + "\n")
+            self.file.write("# time[ps] target_time[ps] work[kJ/mol], then per group: d[nm] (COM "
+                            "displacement along n since the start) f[kJ/mol/nm] (force along n)\n")
+            self.file.flush()
+        if self.velocity:
+            self.move_targets(simulation.context)
+
+    def move_targets(self, context: openmm.Context) -> None:
+        """Move the targets to the middle of the next interval; add the work done."""
+        groups = {PULL_FORCE_GROUP}
+        e0 = context.getState(getEnergy=True, groups=groups).getPotentialEnergy()
+        t = context.getTime().value_in_unit(unit.picosecond)
+        context.setParameter("pull_time", t + 0.5 * self.nupdate * self.dt)
+        e1 = context.getState(getEnergy=True, groups=groups).getPotentialEnergy()
+        self.work += (e1 - e0).value_in_unit(unit.kilojoule_per_mole)
+
+    def describeNextReport(self, simulation: app.Simulation) -> dict[str, Any]:
+        step = simulation.currentStep
+        to_log = self.nlog - step % self.nlog
+        steps = min(to_log, self.nupdate - step % self.nupdate) if self.velocity else to_log
+        return {"steps": steps, "periodic": False, "include": ["positions"] if steps == to_log else []}
+
+    def report(self, simulation: app.Simulation, state: openmm.State) -> None:
+        step = simulation.currentStep
+        if step % self.nlog == 0:
+            x = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            tp = state.getParameters()["pull_time"] if self.velocity else 0.0
+            com = lambda b: self.mass[b] @ x[b] / self.mass[b].sum()  # noqa: E731
+            cols = [f"{state.getTime().value_in_unit(unit.picosecond):.3f}", f"{tp:.3f}", f"{self.work:.4f}"]
+            for p in self.pulls:
+                d = p["n"] @ (com(p["beads"]) - p["target"] - (0 if p["anchor"] is None else com(p["anchor"])))
+                f = p["f"] if p["kind"] == "pull" else -p["k"] * (d - p["v"] * tp)
+                cols += [f"{d:.4f}", f"{f:.3f}"]
+            self.file.write(" ".join(cols) + "\n")
+            self.file.flush()
+        if self.velocity and step % self.nupdate == 0:
+            self.move_targets(simulation.context)
+
+
+def add_reporter(sim: Sim, simulation: app.Simulation, append: bool) -> None:
+    """Attach PullReporter if the system has pulled groups."""
+    if getattr(sim, "posres_pulls", None):
+        simulation.reporters.append(PullReporter(sim, simulation, append))

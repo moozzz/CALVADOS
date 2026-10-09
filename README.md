@@ -80,3 +80,5 @@ The test `test_potentials` simulates two free amino acids, calculates the potent
 
 4. `platform = 'OpenCL'` accepted along with `CPU` and `CUDA`
 
+5. Constant-velocity pulling
+
