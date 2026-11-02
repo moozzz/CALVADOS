@@ -1,7 +1,7 @@
 """Position restraints, constant-force and constant-velocity pulling on the centres of mass
 of selected beads.
 
-Added by patch_calvados_position_restraints_fpull_vpull.py. Enabled in config.yaml with
+Added by patch_calvados_position_restraints.py (patch version 3). Enabled in config.yaml with
 position_restraints = True; fposition_restraints is a YAML file with a list of entries,
 each a position restraint (k), a constant pulling force (force and direction) or
 constant-velocity pulling (velocity, k and direction):
@@ -51,22 +51,31 @@ on the anchor COM. d is not minimum-imaged, so the force is exact for any pulled
 the pulling energy jumps by force*n.L if OpenMM moves the pulled molecule by a box vector
 L (GPU platforms; forces and dynamics are not affected).
 Constant-velocity pulling: E = 0.5 k (n.dt)^2 with dt the minimum-image displacement of
-the COM from its moving target, start + velocity*t*n (relative to the anchor COM), so only
-the component along n is restrained (the reaction acts on the anchor COM). dt is the lag
-behind the target and stays small, so any pulled distance is fine. PullReporter moves the
-targets every update_steps steps (the smallest value of all entries) to the middle of the
-next interval, adds up the work done by moving them (the jumps of the spring energy, exact
-for this stepwise protocol) and writes pull_<sysname>.txt every logfreq steps. t is the
-simulation time: it continues after a checkpoint, but restarts at 0 for restart =
-'pdb'/'cif'. COMs are weighted by the bead masses. Targets come from the start structure
-built from the input (top.pdb), also when the run continues from a checkpoint.
+the COM from its moving target, origin + velocity*t*n (relative to the anchor COM), so only
+the component along n is restrained (the reaction acts on the anchor COM). The pull starts
+with the production run (the spring is off during the energy minimisation and any
+equilibration): the origin is the COM at that moment and t the time since then, so the
+spring starts relaxed. dt is the lag behind the target; it, and for a direction that is
+not along a box axis also the sideways drift of the COM, must stay below half the box
+length minus 1 nm. PullReporter moves the targets every update_steps steps (the smallest
+value of all entries) to the middle of the next interval, adds up the work done by moving
+them (the jumps of the spring energy, exact for this stepwise protocol) and writes
+pull_<sysname>.txt every logfreq steps. The start time, the origins and the work are kept
+in restart.chk, so a continuation carries on exactly. A new pull starts, and the previous
+log is kept as backup_pull_<sysname>_<date>.txt, in a new run, with restart = 'pdb'/'cif',
+or when the velocity entries (groups, k, velocity, direction) changed.
+COMs are weighted by the bead masses. Targets of restraints and constant forces come from
+the start structure built from the input (top.pdb), also when the run continues from a
+checkpoint (topol 'random': the targets of the first run, from posres_<sysname>.txt).
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import warnings
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
@@ -96,7 +105,7 @@ PULL = "-f*(nx*(x1 - ({X})) + ny*(y1 - ({Y})) + nz*(z1 - ({Z})))"
 # spring along n to the moving target t = X + v*pull_time*n; n.(COM - t) from the minimum
 # images of COM - t -/+ n: |a + n|^2 - |a - n|^2 = 4 n.a
 VELOCITY = (
-    "0.5*k*p^2;"
+    "pull_on*0.5*k*p^2;"
     "p = (pointdistance(x1, y1, z1, tx - nx, ty - ny, tz - nz)^2"
     " - pointdistance(x1, y1, z1, tx + nx, ty + ny, tz + nz)^2)/4;"
     "tx = {X} + nx*v*pull_time; ty = {Y} + ny*v*pull_time; tz = {Z} + nz*v*pull_time"
@@ -108,6 +117,7 @@ PARAMETERS = {
 }
 PULL_UPDATE_STEPS = 100  # default steps between moves of the constant-velocity targets
 PULL_FORCE_GROUP = 30    # force group of the constant-velocity springs (work bookkeeping)
+POSRES_VERSION = 3  # 1: restraints, constant force; 2: + constant velocity; 3: + pull state in restart.chk
 KJ_PER_NM_IN_PN = 1.66054  # 1 kJ/mol/nm in pN
 VMD_KEYWORDS = {"chain": "chainID", "residue": "resindex", "segname": "segid"}
 
@@ -196,7 +206,13 @@ class Structure:
     def __init__(self, fname: str, nbeads: int):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.u = Universe(app.PDBxFile(fname)) if fname.lower().endswith(".cif") else Universe(fname)
+            if fname.lower().endswith(".cif"):
+                cif = app.PDBxFile(fname)
+                self.u = Universe(cif)
+                # MDAnalysis numbers the residues of an OpenMM topology 1..N: use the file's numbers
+                self.u.residues.resids = np.array([int(r.id) for r in cif.topology.residues()])
+            else:
+                self.u = Universe(fname)
         self.fname = fname
         if len(self.u.residues) != nbeads:
             raise ValueError(
@@ -267,7 +283,8 @@ def make_force(kind: str, anchored: bool) -> openmm.CustomCentroidBondForce:
     for p in PARAMETERS[kind]:
         force.addPerBondParameter(p)
     if kind == "velocity":
-        force.addGlobalParameter("pull_time", 0.0)  # ps, set by PullReporter
+        force.addGlobalParameter("pull_time", 0.0)  # ps since the start of the pull, set by PullReporter
+        force.addGlobalParameter("pull_on", 0.0)  # switched on by PullReporter (off during minimisation)
         force.setForceGroup(PULL_FORCE_GROUP)
     # restraints and constant velocity: minimum image; constant force: plain coordinates
     force.setUsesPeriodicBoundaryConditions(kind != "pull")
@@ -299,7 +316,7 @@ def build(sim: Sim) -> list[openmm.Force]:
     structures: dict[str, Structure] = {}
 
     forces: dict[tuple[str, bool], openmm.CustomCentroidBondForce] = {}
-    records = []
+    records, bonds = [], []  # bonds: (force, index, groups, params, flags, absolute target)
     sim.posres_pulls = []  # pulled groups, for PullReporter
     sim.posres_mass = mass
     sim.posres_update_steps = min((e.update_steps or PULL_UPDATE_STEPS for e in entries
@@ -356,12 +373,14 @@ def build(sim: Sim) -> list[openmm.Force]:
                 target = com if anchor is None else com - anchor_com
                 group = force.addGroup(b.tolist(), mass[b].tolist())
                 bond = [group] if anchor is None else [group, anchor_group]
-                force.addBond(bond, [*params, *target, *flags])
+                index = force.addBond(bond, [*params, *target, *flags])
+                bonds.append((force, index, bond, params, flags, anchor is None))
                 if kind != "restraint":
                     sim.posres_pulls.append(dict(
                         kind=kind, label=struct.describe(g), beads=b, target=target, n=direction,
                         anchor=None if anchor is None else anchor + offset,
-                        k=entry.k, f=entry.force, v=None if entry.velocity is None else entry.velocity / 1000.0))
+                        k=entry.k, f=entry.force, v=None if entry.velocity is None else entry.velocity / 1000.0,
+                        force=force, bond=index, groups=bond))
                 records.append(
                     f"{len(records) + 1} {n} {comp.name} {copy + 1} {struct.describe(g)} {columns} "
                     f"{target[0]:.4f} {target[1]:.4f} {target[2]:.4f} {len(b)} {ranges(b)} "
@@ -391,13 +410,43 @@ def build(sim: Sim) -> list[openmm.Force]:
                   + ("" if anchor is None else
                      f", opposite force on the COM of {len(anchor)} anchor beads"))
 
-    with open(f"{sim.path}/posres_{sim.config.sysname}.txt", "w") as f:
+    fname = f"{sim.path}/posres_{sim.config.sysname}.txt"
+    keep = False
+    if sim.config.restart == "checkpoint" and sim.restart_path.is_file() and os.path.isfile(fname):
+        # continuation: keep the absolute targets of the first run if the molecules were
+        # placed differently this time (e.g. topol 'random'); same targets otherwise
+        saved = [line.split() for line in open(fname) if line.strip() and not line.startswith("#")]
+        if len(saved) == len(records) and all(s[18] == r.split()[18] for s, r in zip(saved, records)):
+            for s, r, (force, index, groups, params, flags, absolute) in zip(saved, records, bonds):
+                old, new = np.array(s[14:17], dtype=float), np.array(r.split()[14:17], dtype=float)
+                if absolute and s[5] != "velocity" and np.abs(old - new).max() > 1e-3:
+                    force.setBondParameters(index, groups, [*params, *old, *flags])
+                    keep = True
+            if keep:
+                print(f"Position restraints: targets of the first run taken from {fname}")
+    vel = [p for p in sim.posres_pulls if p["kind"] == "velocity"]
+    if vel:
+        # pull state saved in restart.chk: identity of the pulling setup, start time, work
+        # and the origin of every target (set by PullReporter)
+        key = repr([(ranges(p["beads"]), None if p["anchor"] is None else ranges(p["anchor"]),
+                     p["k"], p["v"], [round(float(x), 6) for x in p["n"]]) for p in vel])
+        sim.posres_pull_id = float(int(hashlib.sha256(key.encode()).hexdigest()[:12], 16))
+        host = vel[0]["force"]
+        for name in ("pull_id", "pull_t0", "pull_work"):
+            host.addGlobalParameter(name, 0.0)
+        for i, p in enumerate(vel, 1):
+            p["index"] = i
+            for c in "xyz":
+                host.addGlobalParameter(f"pull_o{i}_{c}", 0.0)
+    if keep:
+        return list(forces.values())
+    with open(fname, "w") as f:
         f.write("# restraint: E = 0.5 k max(0, |d| - r0)^2, d = minimum-image displacement of "
                 "COM(beads) from its target in the restrained dims\n"
                 "# pull: constant force f along n on COM(beads) [and -f n on COM(anchor)], "
                 "E = -f n.d, d = displacement of COM(beads) from its target\n"
                 "# velocity: spring k along n to the target moving at v, E = 0.5 k (n.(COM(beads) - "
-                "target - v time n))^2 (minimum image)\n"
+                "origin - v time n))^2 (minimum image), origin = COM at the start of the pull\n"
                 "# target t: start COM, or start COM - COM(anchor) with an anchor; beads 1-based\n"
                 "# id entry component copy chains type k[kJ/mol/nm^2] r0[nm] dims f[kJ/mol/nm] "
                 "v[nm/ns] nx ny nz tx[nm] ty[nm] tz[nm] nbeads beads anchor\n")
@@ -408,29 +457,70 @@ def build(sim: Sim) -> list[openmm.Force]:
 class PullReporter:
     """OpenMM reporter for the pulled groups (attached by Sim.simulate).
 
-    Constant velocity: every update_steps steps the targets move to the middle of the next
-    interval (pull_time = t + update_steps*dt/2), and the work done by moving them, the
-    change of the spring energy at fixed positions, is added up (exact for the stepwise
-    protocol). Every logfreq steps, pull_<sysname>.txt gets the time, the target
-    time, the total work and, for every pulled group, the displacement of its COM along n
-    since the start (relative to the anchor COM) and the force on it along n.
+    Constant velocity: the pull starts when the reporter is attached (after the energy
+    minimisation) with every target at the current COM of its group (relative to the
+    anchor COM). Every update_steps steps the targets move to the middle of the next
+    interval (pull_time = time since the start + update_steps*dt/2), and the work done by
+    moving them, the change of the spring energy at fixed positions, is added up. The start
+    time, the origins of the targets and the work are context parameters, so restart.chk
+    keeps them and a continuation carries on exactly. A new pull (targets at the current
+    COMs, work 0) starts when the checkpoint holds no pull with the same groups, k, velocity
+    and direction: a new run, restart = 'pdb'/'cif', or changed velocity entries.
+    Every logfreq steps, pull_<sysname>.txt gets the time, the pull time, the total work and,
+    for every pulled group, its COM displacement along n (relative to the anchor COM;
+    constant velocity: since the start of the pull, constant force: from the start
+    structure) and the force on it along n.
     """
 
     def __init__(self, sim: Sim, simulation: app.Simulation, append: bool):
         self.pulls = sim.posres_pulls
         self.mass = sim.posres_mass
-        self.velocity = any(p["kind"] == "velocity" for p in self.pulls)
+        self.vel = [p for p in self.pulls if p["kind"] == "velocity"]
         self.nupdate = sim.posres_update_steps
         self.nlog = sim.config.logfreq
         self.dt = simulation.integrator.getStepSize().value_in_unit(unit.picosecond)
+        context = simulation.context
+        t = context.getTime().value_in_unit(unit.picosecond)
+        self.t0, self.work, note = 0.0, 0.0, None
+        continuing = append
+        if self.vel:
+            continuing = append and context.getParameter("pull_id") == sim.posres_pull_id
+            if continuing:  # the same pull: origins, start time and work from the checkpoint
+                for p in self.vel:
+                    p["origin"] = np.array([context.getParameter(f"pull_o{p['index']}_{c}") for c in "xyz"])
+                self.t0, self.work = context.getParameter("pull_t0"), context.getParameter("pull_work")
+            else:  # a new pull from the current positions
+                x = context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                for p in self.vel:
+                    p["origin"] = self.com(x, p["beads"]) - (0.0 if p["anchor"] is None else self.com(x, p["anchor"]))
+                    for c, value in zip("xyz", p["origin"]):
+                        context.setParameter(f"pull_o{p['index']}_{c}", float(value))
+                self.t0 = t
+                for name, value in (("pull_id", sim.posres_pull_id), ("pull_t0", t), ("pull_work", 0.0), ("pull_time", 0.0)):
+                    context.setParameter(name, value)
+                note = f"# constant-velocity pull started at time {t:.3f} ps, targets at the current COMs\n"
+                print(note[2:].strip())
+            for p in self.vel:
+                p["force"].setBondParameters(p["bond"], p["groups"], [p["k"], p["v"], *p["origin"], *p["n"]])
+            for force in {id(p["force"]): p["force"] for p in self.vel}.values():
+                force.updateParametersInContext(context)
+            context.setParameter("pull_on", 1.0)
         fname = f"{sim.path}/pull_{sim.config.sysname}.txt"
-        self.work = 0.0
-        if append:  # continue the work from the existing log
-            lines = [line for line in open(fname) if line.strip() and not line.startswith("#")] \
-                if os.path.isfile(fname) else []
-            self.work = float(lines[-1].split()[2]) if lines else 0.0
-        self.file = open(fname, "a" if append else "w")
-        if not append:
+        if continuing and os.path.isfile(fname):
+            # drop lines written after the checkpoint (e.g. by a job killed between checkpoints)
+            with open(fname) as f:
+                lines = [line for line in f if line.startswith("#") or not line.strip()
+                         or float(line.split()[0]) <= t + 1e-6]
+            with open(fname, "w") as f:
+                f.writelines(lines)
+            self.file = open(fname, "a")
+        else:
+            if os.path.isfile(fname):  # keep the log of the previous pull
+                stamp = datetime.now().strftime("%Y%d%m_%Hh%Mm%Ss")
+                backup = f"{sim.path}/backup_pull_{sim.config.sysname}_{stamp}.txt"
+                os.replace(fname, backup)
+                print(f"Backing up {fname} to {backup}")
+            self.file = open(fname, "w")
             self.file.write("# pulled groups (see posres_*.txt): id type chains k[kJ/mol/nm^2] "
                             "v[nm/ns] f[kJ/mol/nm] nx ny nz\n")
             for i, p in enumerate(self.pulls, 1):
@@ -439,41 +529,47 @@ class PullReporter:
                 f = f"{p['f']:g}" if p["kind"] == "pull" else "-"
                 self.file.write(f"#   {i} {p['kind']} {p['label']} {k} {v} {f} "
                                 + " ".join(f"{x:.4f}" for x in p["n"]) + "\n")
-            self.file.write("# time[ps] target_time[ps] work[kJ/mol], then per group: d[nm] (COM "
-                            "displacement along n since the start) f[kJ/mol/nm] (force along n)\n")
+            if note:
+                self.file.write(note)
+            self.file.write("# time[ps] pull_time[ps] work[kJ/mol], then per group: d[nm] (COM displacement "
+                            "along n; velocity: since the start of the pull) f[kJ/mol/nm] (force along n)\n")
             self.file.flush()
-        if self.velocity:
-            self.move_targets(simulation.context)
+        if self.vel:
+            self.move_targets(context)
+
+    def com(self, x: np.ndarray, beads: np.ndarray) -> np.ndarray:
+        return self.mass[beads] @ x[beads] / self.mass[beads].sum()
 
     def move_targets(self, context: openmm.Context) -> None:
         """Move the targets to the middle of the next interval; add the work done."""
         groups = {PULL_FORCE_GROUP}
         e0 = context.getState(getEnergy=True, groups=groups).getPotentialEnergy()
         t = context.getTime().value_in_unit(unit.picosecond)
-        context.setParameter("pull_time", t + 0.5 * self.nupdate * self.dt)
+        context.setParameter("pull_time", t - self.t0 + 0.5 * self.nupdate * self.dt)
         e1 = context.getState(getEnergy=True, groups=groups).getPotentialEnergy()
         self.work += (e1 - e0).value_in_unit(unit.kilojoule_per_mole)
+        context.setParameter("pull_work", self.work)  # saved in restart.chk
 
     def describeNextReport(self, simulation: app.Simulation) -> dict[str, Any]:
         step = simulation.currentStep
         to_log = self.nlog - step % self.nlog
-        steps = min(to_log, self.nupdate - step % self.nupdate) if self.velocity else to_log
+        steps = min(to_log, self.nupdate - step % self.nupdate) if self.vel else to_log
         return {"steps": steps, "periodic": False, "include": ["positions"] if steps == to_log else []}
 
     def report(self, simulation: app.Simulation, state: openmm.State) -> None:
         step = simulation.currentStep
         if step % self.nlog == 0:
             x = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-            tp = state.getParameters()["pull_time"] if self.velocity else 0.0
-            com = lambda b: self.mass[b] @ x[b] / self.mass[b].sum()  # noqa: E731
+            tp = state.getParameters()["pull_time"] if self.vel else 0.0
             cols = [f"{state.getTime().value_in_unit(unit.picosecond):.3f}", f"{tp:.3f}", f"{self.work:.4f}"]
             for p in self.pulls:
-                d = p["n"] @ (com(p["beads"]) - p["target"] - (0 if p["anchor"] is None else com(p["anchor"])))
+                ref = p["origin"] if p["kind"] == "velocity" else p["target"]
+                d = p["n"] @ (self.com(x, p["beads"]) - ref - (0 if p["anchor"] is None else self.com(x, p["anchor"])))
                 f = p["f"] if p["kind"] == "pull" else -p["k"] * (d - p["v"] * tp)
                 cols += [f"{d:.4f}", f"{f:.3f}"]
             self.file.write(" ".join(cols) + "\n")
             self.file.flush()
-        if self.velocity and step % self.nupdate == 0:
+        if self.vel and step % self.nupdate == 0:
             self.move_targets(simulation.context)
 
 
