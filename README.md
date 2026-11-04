@@ -40,7 +40,7 @@ conda install -c conda-forge openmm=8.4 mdanalysis=2.9 mdtraj=1.11
 ```
 3. Clone package and install CALVADOS and its dependencies using pip
 ``` 
-git clone https://github.com/KULL-Centre/CALVADOS.git
+git clone https://github.com/moozzz/CALVADOS.git
 cd CALVADOS
 pip install .
 (or pip install -e .)
